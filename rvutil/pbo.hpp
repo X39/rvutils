@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <utility>
 
 namespace rv::util::pbo
 {
@@ -13,85 +14,101 @@ namespace rv::util::pbo
         compressed,
         version
     };
-    struct datablock
+    struct file_descriptor
     {
-        std::streampos start;
-        std::streampos end;
-
-        size_t length() const { return end - start; }
-    };
-    struct metadata
-    {
-        std::string key;
-        std::string value;
-
-        datablock block;
-        bool operator<(const metadata& other) const { return block.start < other.block.start; }
-        bool operator>(const metadata& other) const { return block.end < other.block.end; }
-        bool is_empty_section()
-        {
-            for (auto c : key)
-            {
-                if (c != '?')
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-    };
-    struct header
-    {
-#if defined(_MSVC_LANG)
-#pragma pack(push, 1)
-        using bin = struct
-        {
-            char method[4];
-            uint32_t size_original;
-            uint32_t reserved;
-            uint32_t timestamp;
-            uint32_t size_actual;
-        };
-#pragma pack(pop)
-#else
-        using bin = struct
-        {
-            char method[4];
-            uint32_t size_original;
-            uint32_t reserved;
-            uint32_t timestamp;
-            uint32_t size_actual;
-        } __attribute__((packed));
-#endif
+        // Size as in the PBO
+        size_t size;
+        // Size as the PBO header states this file actually is.
+        // May not be set for all packing methods
+        size_t size_original;
+        // The packing method used as stated in the header.
+        packing_method packing;
+        // The file name
         std::string name;
-        packing_method method;
-
-        uint32_t size_original;
-        uint32_t size_actual;
-        uint32_t timestamp;
-
-        datablock block_entry;
-        datablock block_data;
-        bool operator<(const header& other) const { return block_data.start < other.block_data.start; }
-        bool operator>(const header& other) const { return block_data.end < other.block_data.end; }
-        bool is_empty_section() const
-        {
-            for (auto c : name)
-            {
-                if (c != '?')
-                {
-                    return false;
-                }
-            }
-            return !name.empty();
-        }
-        size_t size() const
-        {
-            return sizeof(bin) + name.length() + 1;
-        }
     };
     class pbofile
     {
+        struct datablock
+        {
+            std::streampos start;
+            std::streampos end;
+
+            size_t length() const { return end - start; }
+        };
+        struct attribute_
+        {
+            std::string key;
+            std::string value;
+
+            datablock block;
+            bool operator<(const attribute_& other) const { return block.start < other.block.start; }
+            bool operator>(const attribute_& other) const { return block.end < other.block.end; }
+            bool is_invalid() const
+            {
+                for (auto c : key)
+                {
+                    if (c != '?')
+                    {
+                        return false;
+                    }
+                }
+                return !key.empty();
+            }
+            size_t bytes() const
+            {
+                return key.length() + 1 + value.length() + 1;
+            }
+        };
+        struct header
+        {
+#if defined(_MSVC_LANG)
+#pragma pack(push, 1)
+            using bin = struct
+            {
+                char method[4];
+                uint32_t size_original;
+                uint32_t reserved;
+                uint32_t timestamp;
+                uint32_t size;
+            };
+#pragma pack(pop)
+#else
+            using bin = struct
+            {
+                char method[4];
+                uint32_t size_original;
+                uint32_t reserved;
+                uint32_t timestamp;
+                uint32_t size;
+            } __attribute__((packed));
+#endif
+            std::string name;
+            packing_method method;
+
+            uint32_t size_original;
+            uint32_t size;
+            uint32_t timestamp;
+
+            datablock block_entry;
+            datablock block_data;
+            bool operator<(const header& other) const { return block_data.start < other.block_data.start; }
+            bool operator>(const header& other) const { return block_data.end < other.block_data.end; }
+            bool is_invalid() const
+            {
+                for (auto c : name)
+                {
+                    if (c != '?')
+                    {
+                        return false;
+                    }
+                }
+                return !name.empty();
+            }
+            size_t bytes() const
+            {
+                return sizeof(bin) + name.length() + 1;
+            }
+        };
     public:
         class reader
         {
@@ -120,8 +137,7 @@ namespace rv::util::pbo
         public:
             reader() : m_good(false) { }
             bool good() const { return m_good; }
-            size_t size() const { return m_block.length(); }
-            size_t read(char* arr, std::streamsize size)
+            size_t read(char* arr, std::streamsize bytes)
             {
                 if (!good())
                 { // Reader was not initialized proper
@@ -133,7 +149,7 @@ namespace rv::util::pbo
                 { // We already read everything readable
                     return 0;
                 }
-                remaining = remaining < size ? remaining : size;
+                remaining = remaining < bytes ? remaining : bytes;
                 m_file.read(arr, remaining);
                 return (size_t)remaining;
             }
@@ -222,7 +238,7 @@ namespace rv::util::pbo
                 auto iter = std::find_if(
                     pbo->m_headers.begin(),
                     pbo->m_headers.end(),
-                    [name](header& h) -> bool {
+                    [name](header h) -> bool {
                     return h.name == name;
                 });
                 if (pbo->m_headers.end() != iter)
@@ -276,7 +292,7 @@ namespace rv::util::pbo
                     header created;
                     created.name = name;
                     created.timestamp = (uint32_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                    created.size_actual = 0;
+                    created.size = 0;
                     created.size_original = 0;
                     created.method = packing_method::none;
                     created.block_entry = { 0, 0 };
@@ -295,7 +311,6 @@ namespace rv::util::pbo
                 }
             }
         public:
-            size_t size() const { return m_header->size(); }
             std::streampos tell()
             {
                 auto pos = m_file.tellg();
@@ -354,26 +369,40 @@ namespace rv::util::pbo
                     } break;
                 }
             }
-            void write(const char* arr, std::streamsize size)
+            void write(const char* arr, std::streamsize bytes)
             {
                 if (!good())
                 { // Reader was not initialized proper
                     return;
                 }
-                m_file.write(arr, size);
-                m_header->block_data.end += size;
-                m_header->size_actual += size;
+                m_file.write(arr, bytes);
+                m_header->block_data.end += bytes;
+                m_header->size += bytes;
                 write_header(m_file, *m_header);
             }
+
+            // Removes any data remaining for the current header.
+            //
+            // Remarks:
+            // - Due to STL limitations, this cannot erase physical data
+            //   The remaining data in this file thus remains unchanged
+            //   and only `size_actual` is updated.
+            void truncate()
+            {
+                m_header->block_data.end = m_file.tellp();
+                m_header->size = m_header->block_data.length();
+            }
             size_t original_size() const { return m_header->size_original; }
-            void original_size(uint32_t size) { m_header->size_original = size; write_header(m_file, *m_header); }
+            void original_size(uint32_t bytes) { m_header->size_original = bytes; write_header(m_file, *m_header); }
+
+            packing_method method() const { return m_header->method; }
+            void method(packing_method m) { m_header->method = m; write_header(m_file, *m_header); }
         };
     private:
         std::filesystem::path m_path;
         std::vector<datablock> m_free_blocks;
         std::vector<header> m_headers;
-        std::vector<metadata> m_metadatas;
-
+        std::vector<attribute_> m_attributes;
         bool m_good;
 
         // Finds the '\0' character in a filestream and returns the characters required to reach it.
@@ -427,9 +456,9 @@ namespace rv::util::pbo
             file.write("\0", 1);
         }
 
-        // Reads a single pbo metadata from the file.
+        // Reads a single pbo attribute_ from the file.
         // Stream position will reset stream on error.
-        static std::optional<metadata> read_metadata(std::fstream& file)
+        static std::optional<attribute_> read_attribute(std::fstream& file)
         {
             auto start_pos = file.tellg();
             auto key = read_string(file);
@@ -439,7 +468,7 @@ namespace rv::util::pbo
                 if (value.has_value())
                 {
                     auto end_pos = file.tellg();
-                    return metadata{ *key, *value, { start_pos, end_pos } };
+                    return attribute_{ *key, *value, { start_pos, end_pos } };
                 }
                 else
                 {
@@ -453,13 +482,13 @@ namespace rv::util::pbo
                 return {};
             }
         }
-        // Writes a single pbo metadata to the file stream where metadata::data.start refers to
+        // Writes a single pbo attribute_ to the file stream where attribute_::data.start refers to
         // 
         // Remakrs:
         // - is_update: true
         //   - Auto-Reset on end
-        //   - Auto-Seek to metadata on start
-        static void write_metadata(std::fstream& file, const metadata& actual, bool is_update = true)
+        //   - Auto-Seek to attribute_ on start
+        static void write_attribute(std::fstream& file, const attribute_& actual, bool is_update = true)
         {
             auto cur = file.tellp();
 
@@ -470,6 +499,9 @@ namespace rv::util::pbo
 
             write_string(file, actual.key);
             write_string(file, actual.value);
+#ifdef _DEBUG
+            file.flush();
+#endif
 
             if (is_update)
             {
@@ -517,7 +549,7 @@ namespace rv::util::pbo
             }
 
             actual.size_original = data_mapped.size_original;
-            actual.size_actual = data_mapped.size_actual;
+            actual.size = data_mapped.size;
             actual.timestamp = data_mapped.timestamp;
             actual.block_entry.start = start_pos;
             actual.block_entry.end = file.tellg();
@@ -542,7 +574,7 @@ namespace rv::util::pbo
 
             header::bin data_mapped;
             data_mapped.reserved = 0;
-            data_mapped.size_actual = actual.size_actual;
+            data_mapped.size = actual.size;
             data_mapped.size_original = actual.size_original;
             data_mapped.timestamp = actual.timestamp;
 
@@ -699,49 +731,49 @@ namespace rv::util::pbo
         // If there are no headers (yet), method is returning immediate.
         //
         // Returns true on success
-        [[nodiscard]] bool ensure_space_header(size_t size)
+        [[nodiscard]] bool ensure_space_header(size_t bytes)
         {
             using namespace std::string_view_literals;
-            if (headers_empty()) { return true; }
+            if (m_headers.size() == 1) { return true; }
             size_t available = 0;
             // Check if additional data is required for the resize operation, inserting the empty header
-            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && available < size; it++)
+            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && available < bytes; it++)
             {
-                if (it->is_empty_section())
+                if (it->is_invalid())
                 {
                     available += it->block_data.length();
                 }
             }
-            if (available < size)
+            if (available < bytes)
             {
                 std::fstream file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out);
                 if (!file.is_open() && !file.good())
                 {
                     return false;
                 }
-                ensure_space_header_inner(file, size, available);
+                ensure_space_header__free_space_for_headers(file, bytes, available);
                 return true;
             }
             return true;
         }
         // Ensures that the datasection has at least the provided amount of bytes available.
         // If there are no headers (yet), method is returning immediate.
-        void ensure_space_header(std::fstream& file, size_t size)
+        void ensure_space_header(std::fstream& file, size_t bytes)
         {
             using namespace std::string_view_literals;
-            if (headers_empty()) { return; }
+            if (m_headers.size() == 1) { return; }
             size_t available = 0;
             // Check if additional data is required for the resize operation, inserting the empty header
-            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && available < size; it++)
+            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && available < bytes; it++)
             {
-                if (it->is_empty_section())
+                if (it->is_invalid())
                 {
                     available += it->block_data.length();
                 }
             }
-            if (available < size)
+            if (available < bytes)
             {
-                ensure_space_header_inner(file, size, available);
+                ensure_space_header__free_space_for_headers(file, bytes, available);
 #if _DEBUG
                 file.flush();
 #endif
@@ -749,11 +781,11 @@ namespace rv::util::pbo
         }
         // Helper method of ensure_space_header parameter overloads.
         // Not intended to be called by itself.
-        void ensure_space_header_inner2(std::fstream& file, std::streamsize size, std::streamsize freed)
+        void ensure_space_header__write_empty_section(std::fstream& file, std::streamsize freed)
         {
             using namespace std::string_view_literals;
             // Check if first header already is empty section
-            if (m_headers.front().is_empty_section())
+            if (m_headers.front().is_invalid())
             {
                 m_headers.front().block_data.start -= std::streampos(freed);
                 write_header(file, m_headers.front());
@@ -762,39 +794,42 @@ namespace rv::util::pbo
             {
                 // Move all data by the header offset physically
                 auto header_off = sizeof(header::bin) + "?????\0"sv.length();
-                copy<4096>(file, headers_front().block_entry.start, headers_back().block_entry.end, headers_front().block_entry.start + std::streampos(header_off));
+                copy<4096>(file,
+                    m_headers.begin()->block_entry.start,
+                    (m_headers.end() - 2)->block_entry.end,
+                    m_headers.begin()->block_entry.start + std::streampos(header_off));
 
                 // Insert empty header to start
                 header freed_section = { };
                 freed_section.name = "?????";
-                freed_section.block_data.start = m_headers.front().block_data.start - std::streampos(size - header_off);
-                freed_section.block_data.end = freed_section.block_data.start + std::streampos(size - header_off);
+                freed_section.block_data.start = m_headers.front().block_data.start - std::streampos(freed - header_off);
+                freed_section.block_data.end = freed_section.block_data.start + std::streampos(freed - header_off);
                 freed_section.block_entry = m_headers.front().block_entry;
                 freed_section.method = packing_method::none;
-                freed_section.size_actual = uint32_t(freed_section.block_data.length());
+                freed_section.size = uint32_t(freed_section.block_data.length());
                 freed_section.timestamp = uint32_t(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
                 m_headers.insert(m_headers.begin(), freed_section);
                 write_header(file, freed_section);
 
                 // Move all data by the header offset virtually
-                for (auto& it : m_headers)
+                for (auto it = m_headers.begin() + 1; it != m_headers.end(); it++)
                 {
-                    it.block_entry.start += header_off;
-                    it.block_entry.end += header_off;
-                    write_header(file, it);
+                    it->block_entry.start += header_off;
+                    it->block_entry.end += header_off;
+                    write_header(file, *it);
                 }
             }
         }
         // Helper method of ensure_space_header parameter overloads.
         // Not intended to be called by itself.
-        void ensure_space_header_inner(std::fstream& file, std::streamsize size, std::streamsize available)
+        void ensure_space_header__free_space_for_headers(std::fstream& file, std::streamsize bytes, std::streamsize available)
         {
             using namespace std::string_view_literals;
-            if (size < 1024) { size = 1024; }
-            if (!m_headers.front().is_empty_section())
+            if (bytes < 1024) { bytes = 1024; }
+            if (!m_headers.front().is_invalid())
             {
                 // Add additional space requested for empty-section-header
-                size += sizeof(header::bin) + "?????\0"sv.length();
+                bytes += sizeof(header::bin) + "?????\0"sv.length();
                 // Ensure we have at least one more header capacity available
                 if (m_headers.size() == m_headers.capacity())
                 {
@@ -803,9 +838,9 @@ namespace rv::util::pbo
             }
             // Count how many header-data moves are required
             std::streamsize freed_data = 0;
-            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && freed_data < size; it++)
+            for (auto it = m_headers.begin(); it != m_headers.end() - /* empty header */ 1 && freed_data < bytes; it++)
             {
-                if (it->is_empty_section())
+                if (it->is_invalid())
                 {
                     continue;
                 }
@@ -816,18 +851,21 @@ namespace rv::util::pbo
             }
             std::streamsize freed = 0;
             // Check if all data needs to be moved plus extra space or just some entries need to be moved to the end
-            if (freed_data < size)
+            if (freed_data < bytes)
             {
                 // Move everything by `size`
-                copy<4096>(file, headers_front().block_data.start, headers_back().block_data.end, headers_front().block_data.start + std::streampos(size));
+                copy<4096>(file,
+                    m_headers.begin()->block_data.start,
+                    (m_headers.end() - 2)->block_data.end,
+                    m_headers.begin()->block_data.start + std::streampos(bytes));
                 for (auto& it : m_headers)
                 {
-                    it.block_data.start += size;
-                    it.block_data.end += size;
+                    it.block_data.start += bytes;
+                    it.block_data.end += bytes;
                     write_header(file, it);
                 }
-                freed = size;
-                ensure_space_header_inner2(file, size, freed);
+                freed = bytes;
+                ensure_space_header__write_empty_section(file, freed);
             }
             else
             { // Just copy to end until we reached the required space
@@ -840,19 +878,18 @@ namespace rv::util::pbo
                     eof = file.tellp();
                     file.seekp(tmp);
                 }
+
                 // Skip all empty sections
-                while (iter->is_empty_section())
+                while (iter->is_invalid())
                 {
-                    if (iter->is_empty_section()) { continue; }
+                    if (iter->is_invalid()) { continue; }
                     iter++;
                 }
 
                 // Move to end until available is satisfied
-                auto iter_moved_to_end = iter;
-
-                while (available < size)
+                auto first_moved_header_iter = iter;
+                while (available < bytes)
                 {
-
                     // Append moved bytes to available
                     available += iter->block_data.length();
                     freed += iter->block_data.length();
@@ -868,98 +905,115 @@ namespace rv::util::pbo
                     // Progress iterator
                     ++iter;
                 }
+                auto last_moved_header_iter = iter;
+                
+                // Set target to last header start (gets updated once at the very end too)
+                auto move_delta_end = (m_headers.end() - 2)->block_entry.start - first_moved_header_iter->block_entry.start;
+                auto move_delta_start = (last_moved_header_iter - 1)->block_entry.start - first_moved_header_iter->block_entry.start;
 
+                // Rewrite the moved virtually to end
+                for (; first_moved_header_iter != last_moved_header_iter; first_moved_header_iter++)
                 {
-                    // Store indexcies
-                    auto index_iter_moved_to_end = iter_moved_to_end - m_headers.begin();
-                    auto index_iter = iter - m_headers.begin();
-
-                    // Invalidates iterators potentially
-                    ensure_space_header_inner2(file, size, freed);
-                    // ToDo: Empty-Section-Header created is too small
-                    // ToDo: empty-header is not properly moved forward, causing any header after this to not be visible
-
-                    // Restore indexcies
-                    iter = m_headers.begin() += index_iter;
-                    iter_moved_to_end = m_headers.begin() += index_iter_moved_to_end;
+                    first_moved_header_iter->block_entry.start += move_delta_end;
+                    first_moved_header_iter->block_entry.end += move_delta_end;
                 }
-
-
-                auto iter_moved_to_end_end = iter;
-                auto offset = iter->block_entry.start - iter_moved_to_end->block_entry.start;
-
-                // Move the, now lower tiered, physically
-                while (iter != m_headers.end() - /* empty header */ 1)
+                // Rewrite the non-moved (but empty) to start
+                for (; last_moved_header_iter != m_headers.end() - 1; last_moved_header_iter++)
                 {
-                    iter->block_entry.start -= offset;
-                    iter->block_entry.end -= offset;
-                    write_header(file, *iter);
-                    iter++;
+                    auto delta = last_moved_header_iter->block_entry.start - move_delta_start;
+                    last_moved_header_iter->block_entry.start -= delta;
+                    last_moved_header_iter->block_entry.end -= delta;
                 }
-
-                // Write out the moved blocks, physically
-                while (iter_moved_to_end != iter_moved_to_end_end)
-                {
-                    iter_moved_to_end->block_entry.start += offset;
-                    iter_moved_to_end->block_entry.end += offset;
-                    write_header(file, *iter_moved_to_end);
-                    iter_moved_to_end++;
-                }
-
+                // Rewrite empty header to very end
+                first_moved_header_iter--;
+                auto move_target_empty = first_moved_header_iter->block_entry.end;
+                m_headers.back().block_entry.end = move_target_empty + std::streamsize(m_headers.back().block_entry.length());
+                m_headers.back().block_entry.start = move_target_empty;
 
                 // Sort virtual representation
                 std::sort(m_headers.begin(), m_headers.end() - /* empty header */ 1);
 
-                // Update empty header ref
-                m_headers.back().block_entry.start = (m_headers.end() - 1)->block_entry.end;
-                m_headers.back().block_entry.end = m_headers.back().block_entry.start + std::streamsize(header().size());
-                write_header(file, m_headers.back());
+                // Invalidates iterators potentially
+                ensure_space_header__write_empty_section(file, freed);
+                if (m_headers.front().is_invalid())
+                {
+                    for (auto& it : m_headers)
+                    {
+                        write_header(file, it);
+                    }
+                }
             }
         }
-        // Ensures that the metadata section has at least the provided amount of bytes available.
+        // Ensures that the attribute_ section has at least the provided amount of bytes available.
         // If there are no headers (yet), method is returning immediate.
-        [[nodiscard]] bool ensure_space_metadatas(size_t size)
+        [[nodiscard]] bool ensure_space_attributes(size_t bytes)
         {
             using namespace std::string_view_literals;
-            if (headers_empty()) { return true; }
+            if (m_headers.size() == 1) { return true; }
             size_t available = 0;
-            for (auto it = m_metadatas.rbegin(); it != m_metadatas.rend() && available < size; it++)
+            for (auto it = m_attributes.rbegin(); it != m_attributes.rend() && available < bytes; it++)
             {
-                if (it->is_empty_section())
+                if (it->is_invalid())
                 {
                     available += it->key.length();
                 }
             }
-            if (available < size)
+            if (available < bytes)
             {
-                if (size < 1024) { size = 1024; }
                 std::fstream file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out);
                 if (!file.is_open() && !file.good())
                 {
                     return false;
                 }
-
-                copy<8192>(file,
-                    m_headers.front().block_entry.start,
-                    m_headers.back().block_data.end,
-                    m_headers.front().block_entry.start + std::streampos(size));
-                for (auto& it : m_headers)
-                {
-                    it.block_data.start += size;
-                    it.block_data.end += size;
-                    it.block_entry.start += size;
-                    it.block_entry.end += size;
-                    write_header(file, it);
-                }
-
-                metadata created;
-                created.value = "";
-                created.key = std::string(size - /* terminating zeros */ 2 , '?');
-                created.block.start = m_metadatas.back().block.end;
-                created.block.end = m_metadatas.back().block.end + std::streampos(size);
-                m_metadatas.push_back(created);
-                write_metadata(file, created);
+                ensure_space_attributes__free_space_for_attributes(file, bytes, available);
             }
+            return true;
+        }
+        // Ensures that the attribute_ section has at least the provided amount of bytes available.
+        [[nodiscard]] void ensure_space_attributes(std::fstream& file, size_t bytes)
+        {
+            using namespace std::string_view_literals;
+            size_t available = 0;
+            for (auto it = m_attributes.rbegin(); it != m_attributes.rend() && available < bytes; it++)
+            {
+                if (it->is_invalid())
+                {
+                    available += it->key.length();
+                }
+            }
+            if (available < bytes)
+            {
+                ensure_space_attributes__free_space_for_attributes(file, bytes, available);
+            }
+        }
+        // Helper method of ensure_space_attributes parameter overloads.
+        // Not intended to be called by itself.
+        [[nodiscard]] void ensure_space_attributes__free_space_for_attributes(std::fstream& file, std::streamsize bytes, std::streamsize available)
+        {
+            if (bytes < 1024) { bytes = 1024; }
+
+            copy<8192>(file,
+                m_headers.front().block_entry.start,
+                m_headers.back().block_data.end,
+                m_headers.front().block_entry.start + std::streampos(bytes));
+            for (auto& it : m_headers)
+            {
+                it.block_data.start += bytes;
+                it.block_data.end += bytes;
+                it.block_entry.start += bytes;
+                it.block_entry.end += bytes;
+                write_header(file, it);
+            }
+
+            attribute_ created;
+            created.value = "";
+            created.key = std::string(bytes - /* terminating zeros */ 2, '?');
+            created.block.start = m_attributes.back().block.start;
+            created.block.end = m_attributes.back().block.start + std::streampos(bytes);
+            m_attributes.insert(m_attributes.end() - 1, created);
+            write_attribute(file, created);
+            m_attributes.back().block.start = created.block.end;
+            m_attributes.back().block.end = m_attributes.back().block.start + std::streamsize(1);
         }
         // Adds the header virtually and physically at the very end of the headers list.
         //
@@ -984,32 +1038,32 @@ namespace rv::util::pbo
         [[nodiscard]] std::vector<header>::iterator push_back(std::fstream& file, header& h)
         {
             // Ensure we have the space available to insert the header to end
-            ensure_space_header(file, h.size());
+            ensure_space_header(file, h.bytes());
 
             // If front is empty section, move its data back further
-            size_t rem = h.size();
-            for (auto& it = m_headers.begin(); it != m_headers.end() && rem > 0 && it->is_empty_section(); ++it)
+            size_t rem = h.bytes();
+            for (auto& it = m_headers.begin(); it != m_headers.end() && rem > 0 && it->is_invalid(); ++it)
             {
-                if (it->size_actual > 0)
+                if (it->size > 0)
                 {
-                    auto reduce = rem < it->size_actual ? rem : it->size_actual;
+                    auto reduce = rem < it->size ? rem : it->size;
                     rem -= reduce;
                     it->block_data.start = it->block_data.start + std::streampos(reduce);
-                    it->size_actual = it->size_actual - reduce;
-                    write_header(file, m_headers.front());
+                    it->size = it->size - reduce;
+                    write_header(file, *it);
                 }
             }
 
             // Set block_entry
             h.block_entry.start = m_headers.back().block_entry.start;
-            h.block_entry.end = h.block_entry.start + std::streamsize(h.size());
+            h.block_entry.end = h.block_entry.start + std::streamsize(h.bytes());
 
             // Write out created header
             write_header(file, h);
 
             // Update & write-out empty header
             m_headers.back().block_entry.start = h.block_entry.end;
-            m_headers.back().block_entry.end = m_headers.back().block_entry.start + std::streampos(m_headers.back().size());
+            m_headers.back().block_entry.end = m_headers.back().block_entry.start + std::streampos(m_headers.back().bytes());
             write_header(file, m_headers.back());
 
             // Update created block_data
@@ -1022,6 +1076,63 @@ namespace rv::util::pbo
 
             // Insert right before empty-header
             return m_headers.insert(m_headers.end() - /* empty header */ 1, h);
+        }
+        // Adds the header virtually and physically at the very end of the headers list.
+        //
+        // Returns true on success.
+        // 
+        // Remarks:
+        // - Dataoffsets invalidate if moving data physically is required.
+        [[nodiscard]] bool push_back(attribute_& m)
+        {
+            std::fstream file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out);
+            if (!file.is_open() && !file.good())
+            {
+                return false;
+            }
+            push_back(file, m);
+            return true;
+        }
+        // Adds the header virtually and physically at the very end of the headers list.
+        // 
+        // Remarks:
+        // - Dataoffsets invalidate if moving data physically is required.
+        [[nodiscard]] std::vector<attribute_>::iterator push_back(std::fstream& file, attribute_& m)
+        {
+            // Ensure we have the space available to insert the header to end
+            ensure_space_attributes(file, m.bytes());
+
+            // If back is empty section, move its data forward
+            size_t rem = m.bytes();
+            auto start = (m_attributes.end() - 2)->block.start;
+            for (auto& it = m_attributes.rbegin() + 1; it != m_attributes.rend() && rem > 0 && it->is_invalid(); ++it)
+            {
+                if (!it->key.empty())
+                {
+                    auto reduce = rem < it->key.length() ? rem : it->key.length();
+                    rem -= reduce;
+                    it->block.start = it->block.start + std::streampos(reduce);
+                    it->key.resize(it->key.size() - reduce);
+                }
+                if (!it->value.empty() && rem > 0)
+                {
+                    auto reduce = rem < it->value.length() ? rem : it->value.length();
+                    rem -= reduce;
+                    it->block.start = it->block.start + std::streampos(reduce);
+                    it->value.resize(it->value.size() - reduce);
+                    write_attribute(file, *it);
+                }
+            }
+
+            // Set block_entry
+            m.block.start = start;
+            m.block.end = start + std::streamsize(m.bytes());
+
+            // Write out created header
+            write_attribute(file, m);
+
+            // Insert right before empty-section-attribute_
+            return m_attributes.insert(m_attributes.end() - /* empty header */ 2, m);
         }
     public:
         pbofile() : m_good(false)
@@ -1072,21 +1183,21 @@ namespace rv::util::pbo
 #endif
 
 
-            // Read in metadatas until we hit a "no value"
-            std::optional<metadata> opt_metadata;
-            while ((opt_metadata = read_metadata(file)).has_value())
+            // Read in attributes until we hit a "no value"
+            std::optional<attribute_> opt_attribute;
+            while ((opt_attribute = read_attribute(file)).has_value())
             {
-                m_metadatas.push_back(*opt_metadata);
+                m_attributes.push_back(*opt_attribute);
             }
-            metadata metadata_empty = {};
-            metadata_empty.block.start = file.tellg();
-            metadata_empty.block.end = metadata_empty.block.start + std::streamsize(1);
-            m_metadatas.push_back(metadata_empty);
+            attribute_ attribute_empty = {};
+            attribute_empty.block.start = file.tellg();
+            attribute_empty.block.end = attribute_empty.block.start + std::streamsize(1);
+            m_attributes.push_back(attribute_empty);
 #if _DEBUG
             DBG_POS = file.tellg();
 #endif
 
-            // Confirm we reached metadatas end
+            // Confirm we reached attributes end
             if (file.get() != '\0')
             { // we failed :(
                 m_good = false;
@@ -1113,7 +1224,7 @@ namespace rv::util::pbo
             for (auto &it : m_headers)
             {
                 it.block_data.start = offset;
-                offset += it.size_actual;
+                offset += it.size;
                 it.block_data.end = offset;
             }
 
@@ -1137,35 +1248,42 @@ namespace rv::util::pbo
             file.flush();
 #endif
 
-            metadata metadata_empty = {};
-            metadata_empty.block.start = file.tellp();
+            attribute_ attribute_empty = {};
+            attribute_empty.block.start = file.tellp();
             file.write("\0", 1);
 #ifdef _DEBUG
             file.flush();
 #endif
 
             header header_empty = {};
-            header_empty.block_entry.start = metadata_empty.block.end = file.tellp();
+            header_empty.block_entry.start = attribute_empty.block.end = file.tellp();
             write_header(file, { }, false);
             header_empty.block_data.start = header_empty.block_data.end = header_empty.block_entry.end = file.tellp();
 #ifdef _DEBUG
             file.flush();
 #endif
 
-            m_metadatas.push_back(metadata_empty);
+            m_attributes.push_back(attribute_empty);
             m_headers.push_back(header_empty);
 
             m_good = true;
         }
 
         // Creates a new reader for the provided header file.
-        [[nodiscard]] bool read(const header& header, reader& out_reader) const
+        [[nodiscard]] bool read(std::string_view filename, reader& out_reader) const
         {
             if (!good())
             {
                 return false;
             }
-            return out_reader.initialize(m_path, header);
+            auto res = std::find_if(m_headers.begin(), m_headers.end(), [filename](header h) -> bool {
+                return h.name == filename && !h.is_invalid();
+            });
+            if (res == m_headers.end())
+            {
+                return false;
+            }
+            return out_reader.initialize(m_path, *res);
         }
         // Creates a new writer, pointing at the end of this pbo for the provided file.
         // Behavior is undefined for more then one active writer.
@@ -1184,17 +1302,161 @@ namespace rv::util::pbo
             return out_writer.initialize(this, name);
         }
 
-        const header& headers_front() const { return m_headers.front(); }
-        const header& headers_back() const { return *(m_headers.end() - 2); }
-        std::vector<header>::const_iterator headers_begin() const { return m_headers.begin(); }
-        std::vector<header>::const_iterator headers_end() const { return m_headers.end() - 1; }
-        bool headers_empty() const { return m_headers.size() == 1; }
+        // Returns all available attributes
+        //
+        // Remarks:
+        // - Creates a new vector of the current attributes and returns it.
+        std::vector<std::pair<std::string, std::string>> attributes() const
+        {
+            std::vector<std::pair<std::string, std::string>> pairs;
+            pairs.reserve(m_attributes.size());
+            for (auto it = m_attributes.begin(); it != m_attributes.end() - 1; ++it)
+            {
+                if (it->is_invalid())
+                {
+                    continue;
+                }
+                pairs.push_back(std::make_pair(it->key, it->value));
+            }
+            return pairs;
+        }
+        // Looks up a single attribute and returns it, if it exists.
+        //
+        // Remarks:
+        // - If the attribute is not existing, empty optional will be returned
+        std::optional<std::string> attribute(std::string_view key) const
+        {
+            auto res = std::find_if(m_attributes.begin(), m_attributes.end(), [key](attribute_ att) -> bool { return att.key == key && !att.is_invalid(); });
+            if (res != m_attributes.end())
+            {
+                return res->value;
+            }
+            return {};
+        }
+        // Set a single attribute
+        //
+        // Remarks:
+        // - Always appends attribute
+        // - If attribute already exists, old attribute gets invalidated.
+        // - Can invalidates any open writers/readers
+        [[nodiscard]] bool attribute(std::string_view key, std::string_view value)
+        {
+            std::fstream file(m_path, std::ios_base::binary | std::ios_base::out | std::ios_base::in);
+            if (!file.is_open() && !file.good())
+            {
+                m_good = false;
+                return false;
+            }
 
+            auto res = std::find_if(m_attributes.begin(), m_attributes.end(), [key](attribute_ att) -> bool { return att.key == key; });
+            if (res != m_attributes.end())
+            {
+                // invalidate old attribute
+                std::transform(res->key.begin(), res->key.end(), res->key.begin(), [](char c) -> char { return '?'; });
+                std::transform(res->value.begin(), res->value.end(), res->value.begin(), [](char c) -> char { return '?'; });
+                write_attribute(file, *res);
 
-        const metadata& metadatas_front() const { return m_metadatas.front(); }
-        const metadata& metadatas_back() const { return *(m_metadatas.end() - 2); }
-        std::vector<metadata>::const_iterator metadatas_begin() const { return m_metadatas.begin(); }
-        std::vector<metadata>::const_iterator metadatas_end() const { return m_metadatas.end() - 1; }
-        bool metadatas_empty() const { return m_metadatas.size() == 1; }
+                // Create attribute
+                attribute_ att = {};
+                att.key = key;
+                att.value = value;
+                push_back(file, att);
+            }
+            else
+            {
+                attribute_ att = {};
+                att.key = key;
+                att.value = value;
+                push_back(file, att);
+            }
+            return true;
+        }
+        // Collects a list of all available files
+        //
+        // Remarks:
+        // - Creates a new vector and returns it.
+        std::vector<file_descriptor> files() const
+        {
+            std::vector<file_descriptor> descriptors;
+            descriptors.reserve(m_headers.size());
+            for (auto it = m_headers.begin(); it != m_headers.end() - 1; ++it)
+            {
+                if (it->is_invalid())
+                {
+                    continue;
+                }
+                file_descriptor descr = {};
+                descr.name = it->name;
+                descr.packing = it->method;
+                descr.size = it->size_original;
+                descr.size = it->size;
+                descriptors.push_back(descr);
+            }
+            return descriptors;
+        }
+
+        // Truncates this pbofile by recreating it in another file.
+        //
+        // Remarks:
+        // - Due to limitations with fstream, deleting from files is not possible.
+        //   Sadly this limitation requires copying to reduce filesizes.
+        bool copy_truncated(std::filesystem::path temporary) const
+        {
+            std::fstream copy(temporary, std::ios_base::binary | std::ios_base::out | std::ios_base::trunc);
+            if (!copy.is_open() && !copy.good())
+            {
+                return false;
+            }
+            std::fstream original(m_path, std::ios_base::binary | std::ios_base::out | std::ios_base::in);
+            if (!original.is_open() && !original.good())
+            {
+                return false;
+            }
+            // Write version header
+            header version = {};
+            version.method = packing_method::version;
+            write_header(copy, version, false);
+
+            for (auto& att : m_attributes)
+            {
+                if (att.is_invalid() || att.block.length() == 1) { continue; }
+                write_attribute(copy, att, false);
+            }
+
+            // Write attribute termination
+            attribute_ attribute_empty = {};
+            attribute_empty.block.start = copy.tellp();
+            copy.write("\0", 1);
+
+            for (auto& h : m_headers)
+            {
+                if (h.is_invalid()) { continue; }
+                write_header(copy, h, false);
+            }
+
+            // Write header termination
+            header header_empty = {};
+            header_empty.block_entry.start = attribute_empty.block.end = copy.tellp();
+            write_header(copy, { }, false);
+            header_empty.block_data.start = header_empty.block_data.end = header_empty.block_entry.end = copy.tellp();
+
+            for (auto& h : m_headers)
+            {
+                if (h.is_invalid()) { continue; }
+                const size_t buffsize = 2048;
+                char buff[buffsize] = {};
+                auto pos = h.block_data.start;
+                original.seekg(h.block_data.start);
+                while (pos != h.block_data.end)
+                {
+                    auto remaining = h.block_data.end - pos;
+                    remaining = remaining < buffsize ? remaining : buffsize;
+                    original.read(buff, remaining);
+                    copy.write(buff, remaining);
+                    pos += remaining;
+                }
+            }
+            return true;
+        }
     };
 }
